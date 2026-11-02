@@ -1,8 +1,9 @@
 # Prusa Binary G-code for OrcaSlicer
 
-Writes OrcaSlicer's G-code out as Prusa `.bgcode`, whether you save it to a file or upload it to
-PrusaLink or Prusa Connect. Requires OrcaSlicer 2.5.0-rc or later, and converts with
-[gcode-lib](https://github.com/hyiger/gcode-lib) 1.2.2, which OrcaSlicer installs on first load.
+Compresses OrcaSlicer's G-code to Prusa `.bgcode` so uploads to the printer take less time. Files are
+about 60% smaller than the text G-code, whether you save to a file or upload to PrusaLink or Prusa
+Connect. Requires OrcaSlicer 2.5.0-rc or later. OrcaSlicer installs
+[gcode-lib](https://github.com/hyiger/gcode-lib) 1.8.0 and `heatshrink2` on first load.
 
 ## Using it
 
@@ -34,9 +35,11 @@ refuse the MK3S family, whose firmware cannot read the format, and printers from
   a `plugins` entry on the printer preset, such as one written by the Printer Agent setting, replace
   the process preset's list, and the conversion is then skipped. Check that a saved `.bgcode` file
   starts with `GCDE` if you use a printer agent.
-- **Files are about the same size as `.gcode`.** Blocks are stored uncompressed, because gcode-lib
-  has no heatshrink or MeatPack encoder. You get the format's metadata and thumbnails but not its
-  smaller files. A cube with five thumbnails went from 279,024 to 271,334 bytes.
+- **The commands stay the same, but the text does not.** `G` commands made only of uppercase words
+  lose their spaces and any comment after the command, and blank lines are dropped. Other lines stay
+  as written.
+- **Do not import settings from a `.bgcode` into PrusaSlicer.** It would take only the few settings it
+  shares with this file and use its defaults for the rest. Use the file to view or print.
 - If you rename the output to `.gcode` in the save or upload dialog, the export fails with an
   explanation, since binary content under that name would not print.
 - **G-code inside a `.gcode.3mf` stays text.** OrcaSlicer stores it in the bundle under a `.gcode`
@@ -48,15 +51,25 @@ refuse the MK3S family, whose firmware cannot read the format, and printers from
 
 ## What the plugin adds to gcode-lib
 
-`gcode_lib.write_bgcode()` 1.2.2 serialises thumbnails and one G-code block. Prusa's format asks for
-more, so the plugin provides it:
+gcode-lib compresses the G-code with the settings PrusaSlicer uses: Heatshrink 12/4 over MeatPack,
+keeping comments, in blocks of 64 KiB of text. `heatshrink2` is what makes this worthwhile, because
+conversion time counts against what the smaller file saves. Its C encoder takes about 0.03 s per MB
+of G-code. gcode-lib's pure-Python fallback takes about 0.9 s, which would cancel the saving on a fast
+connection.
 
-| | `write_bgcode()` 1.2.2 | This plugin |
+Prusa's format asks for more than `gcode_lib.write_bgcode()` provides, so the plugin adds it:
+
+| | `write_bgcode()` | This plugin |
 | --- | --- | --- |
 | File header version | 2, which libbgcode rejects when it enforces the version | 1 |
-| Printer, print and slicer metadata | absent, though the specification requires them | present |
+| Printer, print and slicer metadata | absent, though the specification requires them | present, with print and slicer metadata deflated as in PrusaSlicer |
 | File metadata (producer) | absent | present |
-| G-code blocks | one, however large | 64 KiB each, as libbgcode writes them |
+| Slicer settings | absent | safe for other tools to read |
+
+PrusaSlicer reads the slicer metadata of every `.bgcode` and refuses to open the file if it cannot
+parse a value of a setting it also has, such as Orca's `ironing_type = no ironing`. So the settings
+its G-code viewer needs are written under their PrusaSlicer names, and the whole Orca config follows
+with an `orca_` prefix, which it ignores.
 
 Printer metadata uses the `M862.3` printer id from the G-code, such as `COREONE`, because that is
 what the firmware checks. Orca's own `printer_model` value is a display name, such as
@@ -69,11 +82,12 @@ on a 40 MB file. Streaming peaks at about 31 MB.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install gcode-lib==1.2.2 pytest pytest-cov
+.venv/bin/pip install gcode-lib==1.8.0 heatshrink2==0.15.0 pytest pytest-cov
 .venv/bin/python -m pytest
 ```
 
-`pytest` fails below 100% line and branch coverage. Tests run against the real gcode-lib and a stand-in
+`pytest` fails below 100% line and branch coverage, and if the output stops being substantially smaller
+than the text G-code. Tests run against the real gcode-lib and a stand-in
 for OrcaSlicer's `orca` module, with two real files sliced by OrcaSlicer 2.5.0-rc in
 `tests/fixtures/`: one from the command line, and one from the GUI that has thumbnails.
 `tests/bgcode_reader.py` is a strict reader written from the
@@ -88,6 +102,7 @@ with the feature on for each:
 - [ ] Run the toggle. The filename format ends in `.bgcode` and the Slicing Pipeline Plugin lists the
       export. Run it again and both are restored.
 - [ ] **Export G-code file.** The save dialog proposes `.bgcode` and the saved file starts with `GCDE`.
+- [ ] Open that file in PrusaSlicer's G-code viewer. It loads and shows the toolpaths on the right bed.
 - [ ] Rename to `.gcode` in that dialog. The export fails with the explanatory message.
 - [ ] **Send to PrusaLink**, with and without *Upload and Print*. The printer lists the file with its
       thumbnail, print time and filament, and it prints.

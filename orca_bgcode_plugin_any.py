@@ -1,17 +1,18 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["gcode-lib==1.2.2"]
+# dependencies = ["gcode-lib==1.8.0", "heatshrink2==0.15.0"]
 #
 # [tool.orcaslicer.plugin]
 # name = "Prusa Binary G-code"
-# description = "Saves G-code as .bgcode for Prusa printers, for file export, PrusaLink and Prusa Connect."
+# description = "Compresses G-code to .bgcode for Prusa printers, for faster uploads to PrusaLink and Prusa Connect."
 # author = "hyiger"
 # version = "1.0.0"
 # type = "slicing-pipeline"
 # ///
-"""Prusa Binary G-code -- writes Orca's text G-code out as a Prusa .bgcode file.
+"""Prusa Binary G-code -- writes Orca's text G-code out as a compressed Prusa .bgcode file.
 
-Two capabilities cooperate:
+The point is shorter uploads: the file is about 60% smaller than the text G-code. Two capabilities
+cooperate:
 
 * "Prusa Binary G-code Export" converts the file at Step.psGCodePostProcess, the one seam shared by
   file export, PrusaLink and Prusa Connect.
@@ -27,10 +28,11 @@ capability not running, cannot be caught here, which is why the two settings cha
 
 G-code inside a .gcode.3mf stays text: the host stores it as Metadata/plate_<N>.gcode.
 
-gcode-lib lifts the thumbnails and serialises the G-code and thumbnail blocks. Its write_bgcode()
-alone does not make a complete file, so this plugin adds what the format requires of it: the
-metadata blocks, the file header version the specification defines, and 64 KiB G-code blocks. The
-blocks stay uncompressed, because gcode-lib has no heatshrink or MeatPack encoder.
+gcode-lib lifts the thumbnails and compresses the G-code with MeatPack and Heatshrink, using the
+same settings as PrusaSlicer. heatshrink2 makes that about 25 times faster than gcode-lib's pure
+Python encoder, which is what keeps the conversion from costing more time than the smaller file
+saves. write_bgcode() alone does not make a complete file, so this plugin adds the metadata blocks
+and the file header version the specification defines.
 
 The file is streamed rather than loaded with gcode_lib.load(), whose per-line objects cost about
 1 GB of memory on a 40 MB file, on top of the slicer's own use.
@@ -63,6 +65,7 @@ BLOCK_SLICER_METADATA = 2
 BLOCK_PRINTER_METADATA = 3
 BLOCK_PRINT_METADATA = 4
 COMPRESSION_NONE = 0
+COMPRESSION_DEFLATE = 1
 ENCODING_INI = 0
 
 # libbgcode's block size. The firmware resumes a print from the start of a block and waits for a
@@ -110,6 +113,41 @@ PRINT_STATISTICS = (
     "estimated printing time (normal mode)",
     "estimated first layer printing time (normal mode)",
 )
+# PrusaSlicer parses the slicer metadata of any .bgcode, whoever produced it, and refuses to open the
+# file if it cannot read a value of a setting it also has, such as Orca's ironing_type "no ironing".
+# Orca shares 138 setting names with it, not all with the same meaning or values, so only the settings
+# its G-code viewer reads and that mean the same in both keep a PrusaSlicer name (PrusaSlicer name ->
+# Orca config key). The whole Orca config follows under a prefix, which PrusaSlicer ignores.
+SLICER_CONFIG_KEYS = {
+    "bed_shape": "bed_shape",
+    "extruder_colour": "extruder_colour",
+    "filament_colour": "filament_colour",
+    "filament_cost": "filament_cost",
+    "filament_density": "filament_density",
+    "filament_diameter": "filament_diameter",
+    "first_layer_height": "first_layer_height",
+    "gcode_flavor": "gcode_flavor",
+    "machine_max_acceleration_e": "machine_max_acceleration_e",
+    "machine_max_acceleration_extruding": "machine_max_acceleration_extruding",
+    "machine_max_acceleration_retracting": "machine_max_acceleration_retracting",
+    "machine_max_acceleration_travel": "machine_max_acceleration_travel",
+    "machine_max_acceleration_x": "machine_max_acceleration_x",
+    "machine_max_acceleration_y": "machine_max_acceleration_y",
+    "machine_max_acceleration_z": "machine_max_acceleration_z",
+    "machine_max_feedrate_e": "machine_max_speed_e",
+    "machine_max_feedrate_x": "machine_max_speed_x",
+    "machine_max_feedrate_y": "machine_max_speed_y",
+    "machine_max_feedrate_z": "machine_max_speed_z",
+    "machine_max_jerk_e": "machine_max_jerk_e",
+    "machine_max_jerk_x": "machine_max_jerk_x",
+    "machine_max_jerk_y": "machine_max_jerk_y",
+    "machine_max_jerk_z": "machine_max_jerk_z",
+    "max_print_height": "printable_height",
+    "nozzle_diameter": "nozzle_diameter",
+    "single_extruder_multi_material": "single_extruder_multi_material",
+    "z_offset": "z_offset",
+}
+ORCA_CONFIG_PREFIX = "orca_"
 # Orca's bed type -> the config key of its temperature after the first layer, like PrusaSlicer's
 # bed_temperature.
 BED_TEMPERATURE_KEYS = {
@@ -143,7 +181,8 @@ def read_sections(path):
     missing end marker can then not swallow the print.
     """
     section = "gcode"
-    with open(path, encoding="utf-8", errors="replace") as lines:
+    # newline="\n" leaves a stray CR for gcode_lib, which ends the line there as the firmware does.
+    with open(path, encoding="utf-8", errors="replace", newline="\n") as lines:
         for line in lines:
             if section != "gcode" and not line.startswith(";"):
                 section = "gcode"
@@ -222,10 +261,40 @@ def print_metadata(scan):
     return {key: scan["statistics"][key] for key in PRINT_STATISTICS if key in scan["statistics"]}
 
 
-def metadata_block(block_type, metadata):
-    """An uncompressed block: the firmware cannot read compressed metadata."""
-    payload = "".join(f"{key}={value}\n" for key, value in metadata.items()).encode("utf-8")
-    body = struct.pack("<HHI", block_type, COMPRESSION_NONE, len(payload)) + struct.pack("<H", ENCODING_INI) + payload
+def viewer_nozzle_diameters(config):
+    """nozzle_diameter with an entry per filament.
+
+    PrusaSlicer's viewer counts tools by nozzle_diameter and ignores tool changes past that count, but
+    a single-nozzle MMU printer has one entry however many filaments it uses.
+    """
+    nozzles = config["nozzle_diameter"].split(",")
+    filaments = config.get("extruder_colour", "").count(";") + 1
+    return ",".join(nozzles + nozzles[-1:] * (filaments - len(nozzles)))
+
+
+def slicer_metadata(scan):
+    config = scan["config"]
+    metadata = {key: config[source] for key, source in SLICER_CONFIG_KEYS.items() if source in config}
+    if "nozzle_diameter" in metadata:
+        metadata["nozzle_diameter"] = viewer_nozzle_diameters(config)
+    metadata.update({ORCA_CONFIG_PREFIX + key: value for key, value in config.items()})
+    return metadata
+
+
+def metadata_block(block_type, metadata, deflate=False):
+    """A metadata block, deflated like PrusaSlicer's print and slicer metadata.
+
+    The firmware cannot read compressed metadata, but it only reads the printer metadata.
+    """
+    text = "".join(f"{key}={value}\n" for key, value in metadata.items()).encode("utf-8")
+    params = struct.pack("<H", ENCODING_INI)
+    if deflate:
+        payload = zlib.compress(text)
+        header = struct.pack("<HHII", block_type, COMPRESSION_DEFLATE, len(text), len(payload))
+    else:
+        payload = text
+        header = struct.pack("<HHI", block_type, COMPRESSION_NONE, len(text))
+    body = header + params + payload
     return body + struct.pack("<I", zlib.crc32(body))
 
 
@@ -235,7 +304,7 @@ def thumbnail_blocks(thumbnail_text):
 
 
 def gcode_block(text):
-    return gl.write_bgcode(text)[FILE_HEADER_SIZE:]
+    return gl.write_bgcode(text, compress=True)[FILE_HEADER_SIZE:]
 
 
 def gcode_blocks(path):
@@ -262,8 +331,8 @@ def write_bgcode_file(source, target):
         out.write(metadata_block(BLOCK_FILE_METADATA, file_metadata(scan)))
         out.write(metadata_block(BLOCK_PRINTER_METADATA, printer_metadata(scan)))
         out.write(thumbnail_blocks(scan["thumbnail_text"]))
-        out.write(metadata_block(BLOCK_PRINT_METADATA, print_metadata(scan)))
-        out.write(metadata_block(BLOCK_SLICER_METADATA, scan["config"]))
+        out.write(metadata_block(BLOCK_PRINT_METADATA, print_metadata(scan), deflate=True))
+        out.write(metadata_block(BLOCK_SLICER_METADATA, slicer_metadata(scan), deflate=True))
         for block in gcode_blocks(source):
             out.write(block)
 

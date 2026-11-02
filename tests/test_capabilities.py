@@ -226,8 +226,8 @@ def manifest():
     return tomllib.loads("".join(line[2:] + "\n" for line in block.splitlines()))
 
 
-def test_gcode_lib_is_pinned_to_the_required_release():
-    assert manifest()["dependencies"] == ["gcode-lib==1.2.2"]
+def test_dependencies_are_pinned_and_include_the_fast_encoder():
+    assert manifest()["dependencies"] == ["gcode-lib==1.8.0", "heatshrink2==0.15.0"]
 
 
 def test_manifest_identifies_the_plugin():
