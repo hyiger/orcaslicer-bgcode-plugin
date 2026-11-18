@@ -20,8 +20,17 @@ The toggle changes two settings in the process preset, under **Others**:
   extension, and a plugin cannot rename its output, so the name has to come from here.
 - **Slicing Pipeline Plugin** gets *Prusa Binary G-code Export*, which does the conversion.
 
-MINI, MK3.5, MK3.9, MK4, MK4S, XL and CORE One printers are supported. The toggle and the export both
-refuse the MK3S family, whose firmware cannot read the format, and printers from other vendors.
+MINI, MK3.5, MK3.9, MK4, XL, CORE One and iX printers are supported, in every variant: S, +, IS, HF,
+L, MMU3, INDX and multi-tool. Their firmware reads the format from version 5.1.0. The toggle and the
+export both refuse every other printer. That includes the MK3S, MK3, MK2.5 and older, whose 8-bit
+firmware cannot read the format, and printers from other vendors.
+
+A custom printer is recognised by the vendor and model it was given in **Create Printer**, which
+OrcaSlicer joins into one name and does not let you change afterwards. Renaming the preset has no
+effect on it. A printer picked from that dialog's Prusa list is recognised, apart from the MK3S,
+which cannot read the format. For one you type in, use the vendor `Prusa` and the model as Prusa
+writes it, such as `MK3.9S`. The dialog drops a typed `.`, so `MK39S` is recognised too. If the
+export refuses a printer that can read the format, run the toggle to turn the feature off for it.
 
 ### Good to know
 
@@ -31,17 +40,35 @@ refuse the MK3S family, whose firmware cannot read the format, and printers from
   to report one. This happens if the plugin is disabled or uninstalled, or if you remove the export
   from Slicing Pipeline Plugin or revert only one of the two settings by hand. If this happens, run
   the toggle once to bring them back in step.
-- **A printer preset with its own plugin list can cause the same problem.** OrcaSlicer 2.5.0-rc lets
-  a `plugins` entry on the printer preset, such as one written by the Printer Agent setting, replace
-  the process preset's list, and the conversion is then skipped. Check that a saved `.bgcode` file
-  starts with `GCDE` if you use a printer agent.
+- **A printer preset with its own plugin list can cause the same problem.** Changing a printer
+  preset's Printer Agent setting leaves a `plugins` entry on it until OrcaSlicer restarts, and that
+  entry replaces the process preset's list. OrcaSlicer 2.5.1 still finds the conversion by name.
+  OrcaSlicer 2.5.0 and earlier, and nightly builds without that fix, skip it. The toggle cannot tell
+  which OrcaSlicer it runs in, so for such a printer preset it explains this and asks whether to
+  keep the feature off. **Yes**, the safe answer, keeps it off until you have restarted OrcaSlicer
+  and run the toggle again. If the filename format already ended in `.bgcode`, it is set back to
+  `.gcode`. **No** turns the feature on at once. The toggle cannot notice a Printer Agent change
+  made while the feature is already on. On those older versions, restart OrcaSlicer after such a
+  change, and check that a saved `.bgcode` file starts with `GCDE`. Turning the feature off never
+  asks, and the toggle never changes the printer preset.
 - **The commands stay the same, but the text does not.** `G` commands made only of uppercase words
-  lose their spaces and any comment after the command, and blank lines are dropped. Other lines stay
-  as written.
+  lose their spaces and any comment after the command, blank lines are dropped, and CRLF or CR line
+  endings become LF. Other lines stay as written.
 - **Do not import settings from a `.bgcode` into PrusaSlicer.** It would take only the few settings it
   shares with this file and use its defaults for the rest. Use the file to view or print.
 - If you rename the output to `.gcode` in the save or upload dialog, the export fails with an
   explanation, since binary content under that name would not print.
+- **Post-processing scripts, and plugins listed before the export in Slicing Pipeline Plugin, run
+  first, and their result is checked.** If one of them already wrote binary G-code, the export
+  leaves it as it is for a `.bgcode` name on a supported printer, and fails for a `.gcode` name, a
+  3MF or any other printer. If one of them left a file with no commands, the export fails instead
+  of writing a `.bgcode` with nothing to print. Two cases are out of its reach:
+  - A plugin you add after turning the feature on is listed after the export, so it is handed the
+    binary file and nothing checks what it leaves. Run the toggle off and on again to move the export
+    back to the end of the list.
+  - The export knows the destination only by the name OrcaSlicer gives it. If a script renames the
+    output to `.bgcode` while a `.gcode.3mf` is being written, OrcaSlicer passes on that name but
+    still packs the file into the 3MF, so binary G-code ends up inside it without an error.
 - **G-code inside a `.gcode.3mf` stays text.** OrcaSlicer stores it in the bundle under a `.gcode`
   name, so *Export plate sliced file* keeps working with the feature on.
 - Turning the feature off always gives a `.gcode` extension, even if the filename format used `.gco`,
@@ -123,4 +150,10 @@ with the feature on for each:
 - [ ] **Send to Prusa Connect.** Connect accepts the file and shows the same details.
 - [ ] **Export plate sliced file.** The `.gcode.3mf` is written, with text G-code inside.
 - [ ] Toggle off and export. The result is ordinary `.gcode`.
+- [ ] Change the printer preset's Printer Agent setting, then run the toggle with the feature off. A
+      message box names the printer preset and asks whether to keep the feature off. **Yes**, which
+      has the focus, and closing the box leave the process preset unchanged. **No** turns the feature
+      on, and running the toggle again turns it off without asking.
+- [ ] In **Create Printer**, pick vendor `Prusa` and model `Prusa CORE One`, and run the toggle. It
+      turns the feature on. Do the same with a typed model `MK3`. It refuses.
 - [ ] Resume a print after a power panic, which reads the file by block.

@@ -82,7 +82,7 @@ def test_gcode_blocks_are_capped_at_the_libbgcode_size(plugin, gcode_file, monke
 
 def test_gcode_block_size_is_counted_in_bytes(plugin, tmp_path, monkeypatch):
     path = tmp_path / "wide.gcode"
-    path.write_text(("; " + "é" * 40 + "\n") * 3000, encoding="utf-8")  # twice as many bytes as characters
+    path.write_text("G28\n" + ("; " + "é" * 40 + "\n") * 3000, encoding="utf-8")  # twice as many bytes as characters
     texts = text_block_sizes(plugin, monkeypatch, path)
     assert all(len(text.encode("utf-8")) <= 65536 for text in texts)
 
@@ -94,12 +94,12 @@ def test_gcode_blocks_are_filled_rather_than_fragmented(plugin, gcode_file, monk
 
 
 def test_block_size_is_counted_in_bytes_not_characters(plugin, tmp_path):
-    line = "; " + "é" * 40 + "\n"  # twice as many bytes as characters
+    text = "G28\n" + ("; " + "é" * 40 + "\n") * 3000  # the comments have twice as many bytes as characters
     path = tmp_path / "wide.gcode"
-    path.write_text(line * 3000, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     converted = convert(plugin, path)
     assert all(len(block.payload) <= 65536 for block in converted.of_type(reader.GCODE))
-    assert converted.gcode == line * 3000
+    assert converted.gcode == text
 
 
 def test_non_ascii_text_survives_exactly(plugin, tmp_path):
@@ -511,6 +511,91 @@ def test_a_bare_carriage_return_ends_a_line_as_it_does_on_the_printer(plugin, tm
     path = tmp_path / "cr.gcode"
     path.write_bytes(b"; note\rG1 Z0\nG28\n")
     assert convert(plugin, path).commands == ["G1Z0", "G28"]
+
+
+def test_a_command_after_a_bare_carriage_return_leaves_the_config(plugin, tmp_path):
+    path = tmp_path / "cr.gcode"  # a script that mixes line endings: the config comment is followed by a command
+    path.write_bytes(b"; CONFIG_BLOCK_START\r\n; layer_height = 0.2\rG90\r\n; CONFIG_BLOCK_END\r\nG28\r\n")
+    converted = convert(plugin, path)
+    assert converted.commands == ["G90", "G28"]
+    assert converted.metadata(reader.SLICER_METADATA) == {"orca_layer_height": "0.2"}
+
+
+def test_a_command_after_a_bare_carriage_return_leaves_a_thumbnail(plugin, tmp_path):
+    begin, data, end = thumbnail_comment("thumbnail", 16, 16, PNG_DATA).splitlines()
+    path = tmp_path / "cr.gcode"
+    path.write_bytes(f"{begin}\r\n{data}\rG90\r\n{end}\r\nG28\r\n".encode())
+    converted = convert(plugin, path)
+    assert converted.commands == ["G90", "G28"]
+    assert data.removeprefix("; ") not in converted.gcode  # the image data stays out of the print
+
+
+# CR CR LF is what a script on Windows leaves when it rewrites a CRLF file in text mode.
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r", "\r\r\n", "\n\r"], ids=["lf", "crlf", "cr", "crcrlf", "lfcr"])
+def test_every_line_ending_keeps_commands_and_sections_apart(plugin, tmp_path, ending):
+    lines = [
+        "G90",
+        "; CONFIG_BLOCK_START",
+        "; layer_height = 0.2",
+        "; CONFIG_BLOCK_END",
+        "G28",
+        *thumbnail_comment("thumbnail", 16, 16, PNG_DATA).splitlines(),
+        "G1 X1",
+        "; filament used [g] = 3.80",
+    ]
+    path = tmp_path / "endings.gcode"
+    path.write_bytes(ending.join([*lines, ""]).encode())
+    converted = convert(plugin, path)
+    assert converted.commands == ["G90", "G28", "G1X1"]
+    assert converted.metadata(reader.SLICER_METADATA) == {"orca_layer_height": "0.2"}
+    assert converted.metadata(reader.PRINT_METADATA) == {"filament used [g]": "3.80"}
+    assert [block.payload for block in converted.of_type(reader.THUMBNAIL)] == [PNG_DATA]
+    assert "CONFIG_BLOCK" not in converted.gcode and "thumbnail" not in converted.gcode
+    assert "\r" not in converted.gcode
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "\n\n",
+        "; CONFIG_BLOCK_START\n; layer_height = 0.2\n; CONFIG_BLOCK_END\n",
+        thumbnail_comment("thumbnail", 16, 16, PNG_DATA),
+        "; a comment\n;another\n  ; and an indented one\n",
+        "\ufeff",
+        "\ufeff; CONFIG_BLOCK_START\n; layer_height = 0.2\n; CONFIG_BLOCK_END\n",
+    ],
+    ids=["empty", "blank", "config_only", "thumbnail_only", "comments_only", "byte_order_mark", "config_only_after_mark"],
+)
+def test_gcode_without_commands_is_not_converted(plugin, tmp_path, text):
+    path = tmp_path / "nothing.gcode"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(plugin.NothingToPrint):
+        plugin.convert_in_place(str(path))
+    assert path.read_text(encoding="utf-8") == text
+    assert [entry.name for entry in tmp_path.iterdir()] == [path.name]
+
+
+def test_a_byte_order_mark_is_not_part_of_the_first_line(plugin, tmp_path):
+    path = tmp_path / "bom.gcode"  # as PowerShell's "UTF8" encoding writes a file
+    path.write_bytes(b"\xef\xbb\xbf; CONFIG_BLOCK_START\n; layer_height = 0.2\n; CONFIG_BLOCK_END\nG28\n")
+    converted = convert(plugin, path)
+    assert converted.gcode == "G28\n"
+    assert converted.metadata(reader.SLICER_METADATA) == {"orca_layer_height": "0.2"}
+
+
+def test_a_blank_line_does_not_end_a_section_but_a_command_does(plugin, tmp_path):
+    path = tmp_path / "blank.gcode"
+    path.write_text("; CONFIG_BLOCK_START\n\n; a = 1\n \t\n; b = 2\nG28\n; c = 3\n", encoding="utf-8")
+    converted = convert(plugin, path)
+    assert converted.metadata(reader.SLICER_METADATA) == {"orca_a": "1", "orca_b": "2"}
+    assert converted.commands == ["G28"] and "; c = 3" in converted.gcode
+
+
+def test_a_single_command_among_comments_is_enough_to_convert(plugin, tmp_path):
+    path = tmp_path / "one.gcode"
+    path.write_text("; CONFIG_BLOCK_START\n; a = 1\n; CONFIG_BLOCK_END\n; note\n  G28 ; home\n", encoding="utf-8")
+    assert convert(plugin, path).commands == ["G28"]
 
 
 def test_non_utf8_bytes_do_not_stop_the_export(plugin, tmp_path):

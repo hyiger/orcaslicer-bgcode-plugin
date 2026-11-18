@@ -28,6 +28,13 @@ capability not running, cannot be caught here, which is why the two settings cha
 
 G-code inside a .gcode.3mf stays text: the host stores it as Metadata/plate_<N>.gcode.
 
+The host saves whatever the export leaves, also when it reports that it skipped the file. Scripts,
+and the plugins listed before the export in slicing_pipeline_plugin, run before it on the same file,
+so binary G-code one of them wrote is refused wherever this plugin would not have written it itself.
+ctx.output_name is the only sign of the destination. A script can replace it through the
+".output_name" file, and when a 3MF is being written the host still packs the file into the 3MF,
+which cannot be seen from here. A plugin listed after the export is handed the binary file.
+
 gcode-lib lifts the thumbnails and compresses the G-code with MeatPack and Heatshrink, using the
 same settings as PrusaSlicer. heatshrink2 makes that about 25 times faster than gcode-lib's pure
 Python encoder, which is what keeps the conversion from costing more time than the smaller file
@@ -53,6 +60,29 @@ GCODE_EXTENSION = ".gcode"
 BGCODE_EXTENSION = ".bgcode"
 # Every extension the firmware reads as binary G-code.
 BGCODE_EXTENSIONS = (BGCODE_EXTENSION, ".bgc")
+
+# Only Prusa's Buddy firmware reads binary G-code. The i3 printers before the MK3.5 (the MK2, MK2.5,
+# MK3 and MK3S, with their S, + and MMU variants) run the 8-bit firmware, which does not, so a name is
+# accepted for the family it names, not for looking like a Prusa.
+#
+# Orca's own profiles are named like "Prusa MK4S", "Prusa CORE One L HF" and "Prusa XL 5T". A custom
+# printer is named "<vendor> <model>" by the Create Printer dialog and cannot be renamed afterwards,
+# so what that dialog produces has to pass as well. Its own model list repeats the vendor ("Prusa
+# Prusa XL"), as does Prusa's full product name typed as the model ("Prusa Original Prusa MK4S"). Its
+# text fields drop a typed "." ("Prusa MK39S"). And a name copied from PrusaSlicer or the firmware
+# has the vendor "Prusa Research" and a model id that runs together ("MK4SMMU3", "XL5IS", "COREONEL").
+BUDDY_PRINTER = re.compile(
+    r"""(?:(?:Original\ )?Prusa(?:\ Research)?\ )+
+        (?:CORE\ ?One(?:L)?(?:OAK|INDX)?|Signature\ Oak   # the family; the Signature Oak is a CORE One
+           |MINI|MK3\.?5|MK3\.?9|MK4|XL(?:[25]|P)?|iX)     # an XL's tool count; "XLP" is the XL+
+        (?:IS|S|\+)?(?:MMU3)?                             # input shaper, S or + model, MMU
+        (?:[ -].*)?                                       # any variant: HF, L, 5T, INDX 8T
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+SUPPORTED_PRINTERS = "Prusa MINI, MK3.5, MK3.9, MK4, XL, CORE One or iX"
+# What can hand the export G-code that is already binary.
+CONVERTED_EARLIER = "A post-processing script or plugin that runs before this one already converted the G-code."
 
 BGCODE_MAGIC = b"GCDE"
 # Version 1 is the only one libbgcode defines. gcode-lib 1.2.2 stamps 2, so its header is not reused.
@@ -181,10 +211,15 @@ def read_sections(path):
     missing end marker can then not swallow the print.
     """
     section = "gcode"
-    # newline="\n" leaves a stray CR for gcode_lib, which ends the line there as the firmware does.
-    with open(path, encoding="utf-8", errors="replace", newline="\n") as lines:
+    # Universal newlines: a bare CR ends a line as LF and CRLF do, which is how the firmware reads it.
+    # The split has to come before the section is chosen, or a command after a CR would stay attached
+    # to the comment before it and leave the print with that comment's section. utf-8-sig drops a byte
+    # order mark, which would hide a marker on the first line and pass for a command.
+    with open(path, encoding="utf-8-sig", errors="replace") as lines:
         for line in lines:
             if section != "gcode" and not line.startswith(";"):
+                if not line.strip():
+                    continue  # not G-code: a file with CR CR LF line ends has a blank line after every line
                 section = "gcode"
             if section == "gcode":
                 if line.startswith(CONFIG_BEGIN):
@@ -211,9 +246,22 @@ def parse_statistic(line):
     return line[1:separator.start()].strip(), line[separator.end():].strip()
 
 
+def is_command(line):
+    """Whether a line of G-code holds anything besides blanks and a comment."""
+    return bool(line.partition(";")[0].strip())
+
+
 def scan_file(path):
-    """Everything the metadata blocks need from the text G-code."""
-    scan = {"config": {}, "statistics": {}, "thumbnail_text": [], "printer_model": "", "producer": "", "produced_on": ""}
+    """Everything the metadata blocks need from the text G-code, and whether it has any commands."""
+    scan = {
+        "config": {},
+        "statistics": {},
+        "thumbnail_text": [],
+        "printer_model": "",
+        "producer": "",
+        "produced_on": "",
+        "has_commands": False,
+    }
     for section, line in read_sections(path):
         if section == "config":
             key, separator, value = line[1:].partition("=")
@@ -232,9 +280,10 @@ def scan_file(path):
                     scan["statistics"].setdefault(key, value)
                 elif key in KNOWN_STATISTICS:
                     scan["statistics"][key] = value
-        elif not scan["printer_model"]:
+        else:
+            scan["has_commands"] = scan["has_commands"] or is_command(line)
             # The id the firmware itself checks, unlike Orca's printer_model ("Prusa CORE One").
-            if check := PRINTER_CHECK.match(line):
+            if not scan["printer_model"] and (check := PRINTER_CHECK.match(line)):
                 scan["printer_model"] = check[1]
     return scan
 
@@ -323,8 +372,17 @@ def gcode_blocks(path):
         yield gcode_block("".join(pending))
 
 
+class NothingToPrint(Exception):
+    """The G-code has no commands, so there is nothing to print.
+
+    Without any G-code line, its .bgcode would also lack the G-code block every reader requires.
+    """
+
+
 def write_bgcode_file(source, target):
     scan = scan_file(source)
+    if not scan["has_commands"]:
+        raise NothingToPrint
     with open(target, "wb") as out:
         # The specification's block order.
         out.write(FILE_HEADER)
@@ -343,7 +401,10 @@ def is_bgcode_file(path):
 
 
 def convert_in_place(path):
-    """Replace the text G-code at path with .bgcode. A failure leaves the original untouched."""
+    """Replace the text G-code at path with .bgcode. A failure leaves the original untouched.
+
+    Raises NothingToPrint for G-code without commands, such as an empty file.
+    """
     temporary = path + ".bgcode.tmp"
     try:
         write_bgcode_file(path, temporary)
@@ -360,16 +421,71 @@ def split_strings(serialized):
 
 
 def supports_bgcode(printer_model):
-    """Prusa's Buddy printers do. The MK3S family runs older firmware that cannot read the format."""
-    return bool(printer_model) and printer_model.startswith("Prusa") and "MK3S" not in printer_model
+    """Whether Orca's printer_model names a printer that runs Prusa's Buddy firmware."""
+    return bool(printer_model) and BUDDY_PRINTER.fullmatch(printer_model) is not None
 
 
 def unsupported_message(printer_model):
-    return f"Binary G-code is not supported on {printer_model or 'this printer'}."
+    printer = f'The printer model "{printer_model}"' if printer_model else "This printer"
+    return f"Binary G-code needs a {SUPPORTED_PRINTERS}. {printer} is not recognised as one."
+
+
+def capability_names(manifest):
+    """The capability each "plugin;uuid;capability" entry of a serialized plugin list refers to."""
+    names = []
+    for entry in split_strings(manifest):
+        # The host quotes an entry, which holds semicolons, and takes it for a reference only when it
+        # has all three parts and names a plugin and a capability. Escapes are left in: no name with
+        # one can equal the export's.
+        parts = (entry[1:-1] if entry.startswith('"') else entry).split(";", 2)
+        if len(parts) == 3 and parts[0] and parts[2]:
+            names.append(parts[2])
+    return names
+
+
+def hides_export(printer_preset):
+    """Whether the printer preset's own plugin list would keep the host from finding the export.
+
+    The host looks a selected capability up in the "plugins" list of the full config, where a printer
+    preset's list replaces the process preset's. A printer preset has none when it is loaded. Changing
+    its Printer Agent setting gives it one, often empty, that lasts until OrcaSlicer restarts and never
+    names the export. OrcaSlicer 2.5.1 then finds the capability by name. 2.5.0 and earlier, and
+    nightly builds without that fix, skip it without an error. Nothing tells a script which host it
+    runs in.
+    """
+    manifest = printer_preset.config_value("plugins")
+    return manifest is not None and EXPORT_NAME not in capability_names(manifest)
+
+
+def accepts_skipped_conversion(printer_name):
+    """Ask before turning the feature on where the host may skip the conversion. True to turn it on.
+
+    Yes is the safe answer because the host gives that button the focus, so Enter never turns the
+    feature on. Closing the box answers "cancel", which is taken the same way.
+    """
+    answer = orca.host.ui.message(
+        f'The printer preset "{printer_name}" carries a plugin list of its own, which a change to its '
+        "Printer Agent setting leaves behind until OrcaSlicer restarts. OrcaSlicer 2.5.1 runs the "
+        "conversion all the same. Earlier versions, and some nightly builds, use that list in place of the "
+        f"process preset's: they skip the conversion and save text G-code under a {BGCODE_EXTENSION} name, "
+        "which the printer cannot read.\n\n"
+        "Keep binary G-code off for now?\n"
+        f'Yes: it stays off. Restart OrcaSlicer, then run "{TOGGLE_NAME}" again.\n'
+        "No: turn it on now, which is only safe in OrcaSlicer 2.5.1 or later.",
+        TOGGLE_NAME,
+        "yes_no",
+        "warning",
+    )
+    return answer == "no"
 
 
 def notify(level, text):
     orca.host.ui.push_notification(level, text)
+
+
+def failure(message):
+    """A failed export. The host shows the message and keeps the destination from being written."""
+    return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, message)
 
 
 class PrusaBinaryGCodeExport(orca.slicing.SlicingPipelineCapabilityBase):
@@ -379,22 +495,43 @@ class PrusaBinaryGCodeExport(orca.slicing.SlicingPipelineCapabilityBase):
     def execute(self, ctx):
         if ctx.step != orca.slicing.Step.psGCodePostProcess:
             return orca.ExecutionResult.success()
-        if ctx.output_name.lower().endswith(".3mf"):
-            return orca.ExecutionResult.skipped("G-code inside a 3MF stays text.")
-        if is_bgcode_file(ctx.gcode_path):
-            return orca.ExecutionResult.skipped("G-code is already binary.")
+        # The host runs the preset's post-processing scripts, then the plugins selected before this one,
+        # and any of them may already have written binary G-code. The host saves whatever this step
+        # leaves, so the destination is checked even when there is nothing left to convert.
+        already_binary = is_bgcode_file(ctx.gcode_path)
         name = os.path.basename(ctx.output_name)
-        if not is_bgcode_name(name):
-            # Binary content under a .gcode name would be read as text by the firmware.
-            return orca.ExecutionResult.failure(
-                orca.PluginResult.RecoverableError,
-                f'"{name}" does not end in {BGCODE_EXTENSION}, so it cannot hold binary G-code. '
-                f'Name it {BGCODE_EXTENSION}, or run "{TOGGLE_NAME}" to turn the feature off.',
-            )
+        if name.lower().endswith(".3mf"):
+            if already_binary:
+                return failure(
+                    f'"{name}" stores its G-code as text. {CONVERTED_EARLIER} Remove that step to save a 3MF.'
+                )
+            return orca.ExecutionResult.skipped("G-code inside a 3MF stays text.")
         printer_model = ctx.config_value("printer_model")
         if not supports_bgcode(printer_model):
-            return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, unsupported_message(printer_model))
-        convert_in_place(ctx.gcode_path)
+            # With the feature on for such a printer every export stops here, so say how to go on.
+            if already_binary:
+                return failure(f"{unsupported_message(printer_model)} {CONVERTED_EARLIER} Remove that step.")
+            return failure(f'{unsupported_message(printer_model)} Run "{TOGGLE_NAME}" to turn the feature off.')
+        if not is_bgcode_name(name):
+            # Binary content under a .gcode name would be read as text by the firmware.
+            if already_binary:
+                return failure(
+                    f'"{name}" does not end in {BGCODE_EXTENSION}. {CONVERTED_EARLIER} '
+                    f"Name the file {BGCODE_EXTENSION}, or remove that step."
+                )
+            return failure(
+                f'"{name}" does not end in {BGCODE_EXTENSION}, so it cannot hold binary G-code. '
+                f'Name it {BGCODE_EXTENSION}, or run "{TOGGLE_NAME}" to turn the feature off.'
+            )
+        if already_binary:
+            return orca.ExecutionResult.skipped("G-code is already binary.")
+        try:
+            convert_in_place(ctx.gcode_path)
+        except NothingToPrint:
+            return failure(
+                "The G-code has no commands, so there is nothing to convert. Slice again, and check any "
+                "post-processing script or plugin that runs before this one."
+            )
         return orca.ExecutionResult.success(f"Converted {ctx.output_name} ({ctx.host}) to binary G-code.")
 
 
@@ -407,25 +544,44 @@ class TogglePrusaBinaryGCode(orca.script.ScriptPluginCapabilityBase):
         preset = bundle.prints.edited_preset()
         filename_format = preset.config_value("filename_format") or ""
         plugins = split_strings(preset.config_value("slicing_pipeline_plugin"))
+        advice = "Save the preset to keep this setting."
 
-        if SERIALIZED_EXPORT_NAME in plugins:
-            plugins.remove(SERIALIZED_EXPORT_NAME)
-            filename_format, state = with_extension(filename_format, GCODE_EXTENSION), "off"
-        else:
+        turn_on = SERIALIZED_EXPORT_NAME not in plugins
+        if turn_on:
             printer_model = bundle.full_config_value("printer_model")
+            printer = bundle.printers.edited_preset()
             if not supports_bgcode(printer_model):
-                message = unsupported_message(printer_model)
-                notify(orca.host.ui.NotificationLevel.WarningNotificationLevel, message)
-                return orca.ExecutionResult.skipped(message)
+                advice = unsupported_message(printer_model)
+                if not is_bgcode_name(filename_format):
+                    notify(orca.host.ui.NotificationLevel.WarningNotificationLevel, advice)
+                    return orca.ExecutionResult.skipped(advice)
+                turn_on = False
+            elif hides_export(printer) and not accepts_skipped_conversion(printer.name):
+                advice = (
+                    f'Restart OrcaSlicer to clear the plugin list of the printer preset "{printer.name}", '
+                    f'then run "{TOGGLE_NAME}" again.'
+                )
+                if not is_bgcode_name(filename_format):
+                    return orca.ExecutionResult.skipped(f"Binary G-code stays off. {advice}")
+                turn_on = False
+            if not turn_on:
+                # The name is binary without the export, as after removing the export by hand. Staying
+                # off has to undo the name, or text would go on being saved under it.
+                advice = f"Its filename format ended in a binary extension, and now ends in {GCODE_EXTENSION}. {advice}"
+
+        if turn_on:
             plugins.append(SERIALIZED_EXPORT_NAME)
             filename_format, state = with_extension(filename_format, BGCODE_EXTENSION), "on"
+        else:
+            plugins = [plugin for plugin in plugins if plugin != SERIALIZED_EXPORT_NAME]
+            filename_format, state = with_extension(filename_format, GCODE_EXTENSION), "off"
 
         transaction = orca.host.preset.process.begin_update()
         transaction.set("slicing_pipeline_plugin", ";".join(plugins))
         transaction.set("filename_format", filename_format)
         result = transaction.commit()
 
-        message = f'Binary G-code is {state} for "{result.target_name}". Save the preset to keep this setting.'
+        message = f'Binary G-code is {state} for "{result.target_name}". {advice}'
         notify(orca.host.ui.NotificationLevel.RegularNotificationLevel, message)
         return orca.ExecutionResult.success(message)
 

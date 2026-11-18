@@ -84,7 +84,7 @@ class Preset:
 
 
 class Host:
-    """The parts of orca.host the toggle uses, around one process preset."""
+    """The parts of orca.host the toggle uses, around one process preset and one printer preset."""
 
     def __init__(self):
         self.printer_model = "Prusa CORE One"
@@ -92,9 +92,15 @@ class Host:
             "0.20mm Standard",
             {"filename_format": "{input_filename_base}_{print_time}.gcode", "slicing_pipeline_plugin": ""},
         )
+        # A loaded printer preset has no "plugins" entry. Changing its Printer Agent setting adds one.
+        self.printer = Preset("Prusa CORE One 0.4 nozzle", {})
         self.notifications = []
+        self.messages = []
+        self.answer = "yes"  # the button clicked in a message box, or "cancel" when it is closed
         self.commit_error = None
-        self.ui = SimpleNamespace(NotificationLevel=NotificationLevel, push_notification=self._notify)
+        self.ui = SimpleNamespace(
+            NotificationLevel=NotificationLevel, push_notification=self._notify, message=self._message
+        )
         self.preset = SimpleNamespace(
             process=SimpleNamespace(begin_update=lambda: Transaction(self.process, self.commit_error))
         )
@@ -102,9 +108,14 @@ class Host:
     def _notify(self, level, text):
         self.notifications.append((level, text))
 
+    def _message(self, text, title="OrcaSlicer", buttons="ok", icon="info"):
+        self.messages.append((text, title, buttons, icon))
+        return self.answer
+
     def preset_bundle(self):
         return SimpleNamespace(
             prints=SimpleNamespace(edited_preset=lambda: self.process),
+            printers=SimpleNamespace(edited_preset=lambda: self.printer),
             full_config_value=lambda key: self.printer_model if key == "printer_model" else None,
         )
 
@@ -166,9 +177,16 @@ def thumbnail_text():
 
 
 def make_context(
-    orca, gcode_path, output_name="print.bgcode", host="File", step=Step.psGCodePostProcess, printer_model="Prusa CORE One"
+    orca,
+    gcode_path,
+    output_name="print.bgcode",
+    host="File",
+    step=Step.psGCodePostProcess,
+    printer_model="Prusa CORE One",
+    **settings,
 ):
-    config = {"printer_model": printer_model}
+    """The context of one call. Settings are serialized, as the host's config_value() returns them."""
+    config = {"printer_model": printer_model, **settings}
     return SimpleNamespace(
         step=step, gcode_path=str(gcode_path), output_name=output_name, host=host, config_value=config.get
     )
