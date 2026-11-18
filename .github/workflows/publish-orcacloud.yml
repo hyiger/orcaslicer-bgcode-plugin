@@ -16,7 +16,14 @@ env:
   PLUGIN_FILES: "orca_bgcode_plugin_any.py"
 
 jobs:
+  # The release event checks out the tag, so this is the suite run on the revision being published.
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

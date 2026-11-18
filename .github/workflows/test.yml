@@ -1,0 +1,44 @@
+# Runs the test suite on every pull request and push to main. publish-orcacloud.yml also calls it, so
+# a release is only published if the tagged revision passes.
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Python that OrcaSlicer bundles, and the oldest the plugin's header allows.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The runtime dependencies are read from the plugin's header, so the suite runs against the
+      # versions OrcaSlicer installs, including the native heatshrink2.
+      - name: Install the plugin's pinned dependencies
+        run: |
+          set -euo pipefail
+          python - <<'EOF' > requirements.txt
+          import re
+          import tomllib
+
+          source = open("orca_bgcode_plugin_any.py", encoding="utf-8").read()
+          header = re.search(r"^# /// script\n(.*?)^# ///$", source, re.MULTILINE | re.DOTALL)[1]
+          metadata = tomllib.loads("".join(line[2:] + "\n" for line in header.splitlines()))
+          print("\n".join(metadata["dependencies"]))
+          EOF
+          cat requirements.txt
+          python -m pip install -r requirements.txt pytest pytest-cov
+
+      # pyproject.toml makes this fail below 100% line and branch coverage.
+      - name: Run the tests
+        run: python -m pytest

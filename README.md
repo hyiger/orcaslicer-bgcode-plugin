@@ -94,6 +94,10 @@ for OrcaSlicer's `orca` module, with two real files sliced by OrcaSlicer 2.5.0-r
 [specification](https://github.com/prusa3d/libbgcode/blob/main/doc/specifications.md) that shares no
 constants with the plugin.
 
+GitHub runs the same suite on every pull request and push to `main`, through
+`.github/workflows/test.yml`. It uses Python 3.12, which OrcaSlicer bundles, and installs the
+dependencies at the versions pinned in the plugin's header.
+
 ## Publishing
 
 Each GitHub release publishes `orca_bgcode_plugin_any.py` to the plugin's Orca Cloud listing, through `.github/workflows/publish-orcacloud.yml`, which follows [Orca Cloud's guide](https://cloud.orcaslicer.com/wiki/). The repository must first be connected to the listing, in its **Edit plugin** > **GitHub publishing**.
@@ -101,7 +105,8 @@ Each GitHub release publishes `orca_bgcode_plugin_any.py` to the plugin's Orca C
 1. Raise `version` in the plugin's header and push.
 2. Create a release whose tag is that version with a `v`, such as `v1.2.0`. Orca Cloud needs it higher than the listing's current version. The release notes become the changelog.
 
-The workflow stops if the tag is not the header's version.
+The workflow runs the test suite on the tagged revision first. It stops without publishing if a test
+fails or the tag is not the header's version.
 
 ## Testing in OrcaSlicer
 
