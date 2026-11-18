@@ -6,7 +6,7 @@
 # name = "Prusa Binary G-code"
 # description = "Compresses G-code to .bgcode for Prusa printers, for faster uploads to PrusaLink and Prusa Connect."
 # author = "hyiger"
-# version = "1.0.0"
+# version = "1.0.1"
 # type = "slicing-pipeline"
 # ///
 """Prusa Binary G-code -- writes Orca's text G-code out as a compressed Prusa .bgcode file.
